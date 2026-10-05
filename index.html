@@ -1,0 +1,1066 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<title>Snack Time Runner — Protótipo</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0;
+    height: 100dvh; height: 100vh;
+    background: #0A0A0A;
+    color: #fff;
+    font-family: 'Courier New', monospace;
+    overflow: hidden;
+    overscroll-behavior: none;
+    user-select: none; -webkit-user-select: none;
+    touch-action: manipulation;
+  }
+  #wrap {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background:
+      radial-gradient(ellipse at 50% 30%, #FF8C42 0%, #C44100 45%, #4A1C08 100%);
+  }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: -moz-crisp-edges;
+    background: transparent;
+    width: 100vw; height: auto;
+    max-height: 100vh;
+    max-width: calc(100vh * 16 / 9);
+    display: block;
+    box-shadow: 0 0 60px rgba(255, 98, 0, 0.35);
+  }
+  #hint {
+    position: fixed;
+    bottom: 16px; left: 50%;
+    transform: translateX(-50%);
+    font-size: 11px; letter-spacing: 2px;
+    color: rgba(255,255,255,0.5);
+    pointer-events: none;
+    text-transform: uppercase;
+    z-index: 10;
+  }
+
+  /* MOBILE PORTRAIT: rotaciona 90° pra jogar em landscape mesmo com celular em pé */
+  @media (orientation: portrait) {
+    #wrap {
+      width: 100vh;
+      height: 100vw;
+      inset: auto;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) rotate(90deg);
+      transform-origin: center center;
+      overflow: hidden;
+    }
+    /* Canvas mantém 16:9. Após rotação, o visual-width vira canvas.height (em CSS).
+       Pra caber na largura da tela (100vw), precisamos: canvas.width * 9/16 ≤ 100vw
+       → canvas.width ≤ 100vw * 16/9. Cap pelo mínimo entre altura da tela e essa razão. */
+    canvas {
+      width: min(100vh, calc(100vw * 16 / 9));
+      height: auto;
+      max-width: 100vh;
+      max-height: 100vw;
+    }
+    #hint {
+      transform: translateY(-50%) rotate(90deg);
+      transform-origin: center center;
+      bottom: auto;
+      top: 50%;
+      right: 4px;
+      left: auto;
+      white-space: nowrap;
+    }
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="480" height="270"></canvas>
+</div>
+<div id="hint">TOQUE NA TELA PARA PULAR</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+
+  const W = canvas.width;
+  const H = canvas.height;
+
+  // ---------- ASSETS (PNGs reais) ----------
+  const ASSETS = {
+    playerFrames: [null, null, null, null],
+    hero: { run: [], jump: null, fall: null }, // sprite novo (hero-*.png): 4 corrida + pulo + queda
+    tents: [null, null, null],       // tent-1 (wide) | tent-2 (balanced) | tent-3 (tall)
+    gorduras: [null, null, null],    // gordura-1 (wide) | gordura-2 (basic) | gordura-3 (chifruda)
+    bg: null,                        // bg-ccxp.png — pavilhão CCXP, tile horizontal sem emenda
+    stands: [],                      // stands da frente (camada parallax intermediária)
+    loaded: false,
+  };
+  // Herói: frames 60x63, pés na base da imagem, centro do corpo em x=32
+  // Corrida em 4 tempos: passada · passagem · passada (outra perna) · passagem
+  const HERO_RUN_FILES = ['hero-run-1.png', 'hero-run-2.png', 'hero-run-3.png', 'hero-run-4.png'];
+  const HERO_FILES = [...HERO_RUN_FILES, 'hero-jump.png', 'hero-fall.png'];
+  const HERO_ANCHOR_X = 32;
+  const HERO_FRAME_MS = 95;
+
+  // Stands da camada do meio (ordem de aparição) + espaço depois de cada um
+  const STAND_FILES = ['stand-cosplay.png', 'stand-gibis-mangas.png', 'stand-arcade-zone.png', 'stand-cinema.png', 'stand-kpop.png'];
+  const STAND_GAPS = [70, 120, 60, 140, 90];
+  const STAND_PARALLAX = 0.6;                        // fundo 0.3 · stands 0.6 · chão 1.0
+  const STAND_FOG = { color: '#E2622A', amount: 0.32 }; // névoa no próprio sprite: separa os stands da gameplay
+  // Fumaça entre stands e gameplay: faixa de névoa (mais densa no chão) + nuvens que derivam devagar
+  const SMOKE = { color: [226, 98, 40], band: 0.38, puffs: 0.55, top: 120, parallax: 0.8, drift: 0.15 };
+
+  function loadImage(src) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => resolve(null); // resolve mesmo se falhar, jogo cai em fallback
+      img.src = src;
+    });
+  }
+  Promise.all([
+    loadImage('assets/player-1.png'),
+    loadImage('assets/player-2.png'),
+    loadImage('assets/player-3.png'),
+    loadImage('assets/player-4.png'),
+    loadImage('assets/tent-1.png'),
+    loadImage('assets/tent-2.png'),
+    loadImage('assets/tent-3.png'),
+    loadImage('assets/gordura-1.png'),
+    loadImage('assets/gordura-2.png'),
+    loadImage('assets/gordura-3.png'),
+    loadImage('assets/bg-ccxp.png'),
+    ...HERO_FILES.map((f) => loadImage('assets/' + f)),
+    ...STAND_FILES.map((f) => loadImage('assets/' + f)),
+  ]).then(([p1, p2, p3, p4, t1, t2, t3, g1, g2, g3, bg, ...rest]) => {
+    const heroImgs = rest.slice(0, HERO_FILES.length);
+    const stands = rest.slice(HERO_FILES.length);
+    const nRun = HERO_RUN_FILES.length;
+    ASSETS.hero.run = heroImgs.slice(0, nRun).filter(Boolean);
+    ASSETS.hero.jump = heroImgs[nRun];
+    ASSETS.hero.fall = heroImgs[nRun + 1];
+    ASSETS.playerFrames = [p1, p2, p3, p4];
+    ASSETS.tents = [t1, t2, t3];
+    ASSETS.gorduras = [g1, g2, g3];
+    ASSETS.bg = bg;
+    ASSETS.stands = stands.filter(Boolean).map((img) => fogSprite(img, STAND_FOG.color, STAND_FOG.amount));
+    buildStandLayout();
+    ASSETS.loaded = true;
+  });
+
+  // Cores fixas (personagem, gordura, snack — não mudam)
+  const COL = {
+    seara: '#E30613',
+    yellow: '#FFD84A',
+    yellowDark: '#C89A00',
+    grease: '#3A1E0A',
+    greaseLight: '#5A2E10',
+    greaseEye: '#9AFF3C',
+    snack: '#F4A748',
+    snackDark: '#B87020',
+    breading: '#F5C46B',
+    breadingDark: '#A67230',
+    white: '#FFFFFF',
+    black: '#0F0904',
+    hood: '#1F5A2E',
+    hoodLight: '#3E8253',
+    hoodDark: '#0E3218',
+    hoodInner: '#08210F',
+    green: '#39D36A',
+    ccxpPink: '#E4267A',
+    plankShadow: 'rgba(0,0,0,0.28)',
+    // Supreme Destino
+    helmet: '#7A7A85',
+    helmetMid: '#5A5A65',
+    helmetDark: '#2E2E36',
+    neon: '#33FF66',
+    neonDark: '#0E9B34',
+    cape: '#1F5A2E',
+    goldOutline: '#8B5A00',
+  };
+
+  // Paletas dinâmicas de cenário (Snack Time, Cinema, RPG, K-Pop)
+  const PALETTES = [
+    { sky: '#FF8C42', skyDark: '#C44100', floor: '#4A1C08', floorLine: '#2A0F04', bg: '#7A2A00', bg2: '#A63A00' },
+    { sky: '#FF5F7C', skyDark: '#8B0F30', floor: '#3F0518', floorLine: '#1F020C', bg: '#5C0722', bg2: '#8C0F30' },
+    { sky: '#2E8B5F', skyDark: '#0F3A22', floor: '#051F10', floorLine: '#020F08', bg: '#0F3A22', bg2: '#1B5A3B' },
+    { sky: '#A94FD1', skyDark: '#3F1058', floor: '#1F0530', floorLine: '#0F0218', bg: '#4B1478', bg2: '#7028A8' },
+  ];
+  const PALETTE_DURATION = 12000; // 12s por paleta
+  const PALETTE_FADE = 2500;      // 2.5s de transição
+  let currentPalette = { ...PALETTES[0] };
+
+  function hexToRgb(h) {
+    const n = parseInt(h.slice(1), 16);
+    return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+  }
+  function rgbToHex(r, g, b) {
+    const to = (v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0');
+    return '#' + to(r) + to(g) + to(b);
+  }
+  function lerpColor(a, b, t) {
+    const ca = hexToRgb(a), cb = hexToRgb(b);
+    return rgbToHex(ca.r + (cb.r - ca.r) * t, ca.g + (cb.g - ca.g) * t, ca.b + (cb.b - ca.b) * t);
+  }
+
+  function updatePalette() {
+    const cycle = PALETTE_DURATION;
+    const total = worldTime % (cycle * PALETTES.length);
+    const idx = Math.floor(total / cycle);
+    const nextIdx = (idx + 1) % PALETTES.length;
+    const localT = total % cycle;
+    // Fade só no final do ciclo
+    let t = 0;
+    if (localT > cycle - PALETTE_FADE) {
+      t = (localT - (cycle - PALETTE_FADE)) / PALETTE_FADE;
+    }
+    const a = PALETTES[idx], b = PALETTES[nextIdx];
+    for (const k of Object.keys(a)) {
+      currentPalette[k] = t > 0 ? lerpColor(a[k], b[k], t) : a[k];
+    }
+  }
+
+  const GROUND_Y = 240; // alinhado com o topo do chão de tijolos do background PNG
+  const GRAVITY = 0.9;
+  const JUMP_V = -9.6;
+
+  let state = 'menu'; // menu | playing | over
+  let score = 0;
+  let hi = parseInt(localStorage.getItem('snackrunner_hi') || '0', 10);
+  let speed = 3.2;
+  let baseSpeed = 3.2;
+  let elapsed = 0;
+  let worldTime = 0;
+  let spawnTimer = 0;
+  let snackTimer = 0;
+  let obstacles = []; // { x, y, w, h, type: 'grease' | 'greaseBig' | 'greaseFly' }
+  let snacks = [];   // { x, y, w, h, collected }
+  let parallax = 0;
+  let banners = [];
+  let bgTiles = [];
+
+  // Player — tamanho render maior pra valorizar o sprite PNG
+  const player = {
+    x: 60, y: GROUND_Y - 52,
+    w: 48, h: 52,
+    vy: 0,
+    onGround: true,
+    runFrame: 0,
+    frameTick: 0,
+  };
+
+  function resetGame() {
+    score = 0;
+    speed = baseSpeed;
+    elapsed = 0;
+    spawnTimer = 60;
+    snackTimer = 120;
+    obstacles = [];
+    snacks = [];
+    parallax = 0;
+    player.y = GROUND_Y - player.h;
+    player.vy = 0;
+    player.onGround = true;
+    seedBanners();
+    seedBg();
+  }
+
+  function seedBanners() {
+    // Só uma bandeira central grande (fixa) — sem paralaxe
+    banners = [{ centered: true }];
+  }
+  function seedBg() {
+    bgTiles = [];
+    for (let i = 0; i < 7; i++) {
+      bgTiles.push({
+        x: i * 110,
+        w: 68 + Math.floor(Math.random() * 20),
+        h: 42 + Math.floor(Math.random() * 16),
+        hasFlag: Math.random() > 0.35,
+        variant: Math.random() > 0.5 ? 'bg' : 'bg2',
+      });
+    }
+  }
+
+  // Botões clicáveis do game over (coords canvas)
+  const overButtons = {
+    replay: { x: W / 2 - 86, y: 172, w: 172, h: 34, label: 'JOGAR DE NOVO', short: 'DE NOVO' },
+  };
+
+  function inBtn(px, py, b) {
+    return px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h;
+  }
+
+  function canvasCoords(evt) {
+    const rect = canvas.getBoundingClientRect();
+    const cx = (evt.clientX ?? (evt.touches && evt.touches[0]?.clientX) ?? 0) - rect.left;
+    const cy = (evt.clientY ?? (evt.touches && evt.touches[0]?.clientY) ?? 0) - rect.top;
+    return { x: cx * (W / rect.width), y: cy * (H / rect.height) };
+  }
+
+  // Input
+  function jump() {
+    if (state === 'menu') {
+      state = 'playing';
+      resetGame();
+      return;
+    }
+    if (state === 'over') {
+      // tap fora dos botões não faz nada — evita restart acidental
+      return;
+    }
+    if (player.onGround) {
+      player.vy = JUMP_V;
+      player.onGround = false;
+      beep(600, 0.08);
+    }
+  }
+
+  // Portrait rotation: quando o CSS rotaciona o canvas 90°, os coords ficam desalinhados.
+  // Simplificação: em portrait, qualquer tap na tela de game-over = replay.
+  function isPortraitMobile() {
+    return window.innerHeight > window.innerWidth;
+  }
+
+  function handlePointer(evt) {
+    if (state === 'over') {
+      if (isPortraitMobile()) {
+        // qualquer tap = replay
+        state = 'playing';
+        resetGame();
+        beep(800, 0.08, 'triangle', 0.06);
+        return;
+      }
+      const { x, y } = canvasCoords(evt);
+      if (inBtn(x, y, overButtons.replay)) {
+        state = 'playing';
+        resetGame();
+        beep(800, 0.08, 'triangle', 0.06);
+        return;
+      }
+      return;
+    }
+    jump();
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); jump(); }
+  });
+  canvas.addEventListener('pointerdown', (e) => { e.preventDefault(); handlePointer(e); });
+  document.addEventListener('touchstart', (e) => { if (e.target === canvas) e.preventDefault(); }, { passive: false });
+
+  // Audio simples
+  let audio;
+  function beep(freq, dur = 0.1, type = 'square', vol = 0.06) {
+    try {
+      if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+      const o = audio.createOscillator();
+      const g = audio.createGain();
+      o.type = type;
+      o.frequency.value = freq;
+      g.gain.value = vol;
+      o.connect(g); g.connect(audio.destination);
+      o.start();
+      g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + dur);
+      o.stop(audio.currentTime + dur);
+    } catch (_) {}
+  }
+
+  // Sprites — helpers
+  function px(x, y, c, s = 1) { ctx.fillStyle = c; ctx.fillRect(Math.floor(x), Math.floor(y), s, s); }
+  function rect(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(Math.floor(x), Math.floor(y), w, h); }
+
+  // Supreme Destino — Snack-Avatar herói com elmo + capuz + armadura + S dourado
+  // Sprite 32x40
+  // Supreme Destino usando os 4 frames PNG reais (com fallback caso não carregue)
+  function drawPlayer(x, y, frame) {
+    const bx = Math.floor(x), by = Math.floor(y);
+    // Sombra elíptica presa no chão: encolhe e clareia conforme o herói sobe
+    const lift = Math.max(0, GROUND_Y - (by + player.h));
+    const k = Math.max(0.35, 1 - lift / 90);
+    const sw = Math.round((player.w - 12) * k), sx = bx + Math.round((player.w - sw) / 2);
+    const sa = (0.4 * k).toFixed(2);
+    rect(sx, GROUND_Y - 2, sw, 2, `rgba(0,0,0,${sa})`);
+    rect(sx + 4, GROUND_Y - 1, Math.max(0, sw - 8), 1, `rgba(0,0,0,${sa})`);
+
+    // Sprite novo: corrida em 4 frames, pulo (subindo) e queda (descendo)
+    const hero = ASSETS.hero;
+    if (hero.run.length) {
+      let himg = hero.run[frame % hero.run.length];
+      if (!player.onGround) himg = (player.vy < 0 ? hero.jump : hero.fall) || himg;
+      const hx = Math.floor(bx + player.w / 2 - HERO_ANCHOR_X);
+      ctx.drawImage(himg, hx, by + player.h - himg.height);
+      return;
+    }
+
+    const img = ASSETS.playerFrames[frame % 4];
+    if (img) {
+      ctx.drawImage(img, bx, by, player.w, player.h);
+      return;
+    }
+    // Fallback simples se PNG não carregar: retângulo verde
+    rect(bx + 8, by + 4, player.w - 16, player.h - 8, COL.hood);
+    rect(bx + 14, by + 20, 8, 8, COL.yellow);
+  }
+
+  function drawGrease(x, y, w, h, big = false) {
+    x = Math.floor(x); y = Math.floor(y);
+    // Sombra elíptica embaixo
+    rect(x + 2, y + h, w - 4, 2, 'rgba(0,0,0,0.4)');
+
+    // Corpo em forma de pêra/oval — topo estreito, base larga
+    rect(x + 3, y + 2, w - 6, 3, COL.grease);
+    rect(x + 2, y + 4, w - 4, 3, COL.grease);
+    rect(x + 1, y + 6, w - 2, h - 8, COL.grease);
+    rect(x, y + 8, w, h - 10, COL.grease);
+    // Base arredondada
+    rect(x + 1, y + h - 3, w - 2, 3, COL.grease);
+    // Pernas curtinhas (2 pretas embaixo)
+    rect(x + 3, y + h - 1, 3, 2, COL.black);
+    rect(x + w - 6, y + h - 1, 3, 2, COL.black);
+
+    // Highlight (topo-esquerdo)
+    rect(x + 3, y + 4, 3, 2, COL.greaseLight);
+    px(x + 4, y + 3, COL.greaseLight);
+
+    if (big) {
+      // Sobrancelhas agressivas (inclinadas)
+      rect(x + 3, y + 5, 6, 1, COL.black);
+      rect(x + 4, y + 6, 4, 1, COL.black);
+      rect(x + w - 9, y + 5, 6, 1, COL.black);
+      rect(x + w - 8, y + 6, 4, 1, COL.black);
+      // Olhos ovais grandes verde neon
+      rect(x + 4, y + 7, 5, 3, COL.greaseEye);
+      rect(x + 5, y + 6, 3, 1, COL.greaseEye);
+      rect(x + 5, y + 10, 3, 1, COL.greaseEye);
+      rect(x + w - 9, y + 7, 5, 3, COL.greaseEye);
+      rect(x + w - 8, y + 6, 3, 1, COL.greaseEye);
+      rect(x + w - 8, y + 10, 3, 1, COL.greaseEye);
+      // Boca larga com dentes irregulares
+      const my = y + h - 8;
+      rect(x + 4, my, w - 8, 4, COL.black);
+      // Dentes brancos (irregulares)
+      rect(x + 5, my, 2, 2, COL.white);
+      rect(x + 8, my, 2, 3, COL.white);
+      rect(x + 11, my, 2, 2, COL.white);
+      rect(x + 14, my, 2, 3, COL.white);
+      if (w > 24) rect(x + 17, my, 2, 2, COL.white);
+    } else {
+      // Sobrancelhas menores
+      rect(x + 2, y + 5, 4, 1, COL.black);
+      rect(x + w - 6, y + 5, 4, 1, COL.black);
+      // Olhos ovais verde neon
+      rect(x + 3, y + 6, 3, 2, COL.greaseEye);
+      rect(x + w - 6, y + 6, 3, 2, COL.greaseEye);
+      // Boca com poucos dentes
+      const my = y + h - 6;
+      rect(x + 4, my, w - 8, 3, COL.black);
+      rect(x + 5, my, 2, 2, COL.white);
+      rect(x + 8, my, 2, 2, COL.white);
+      if (w > 20) rect(x + 11, my, 2, 2, COL.white);
+    }
+  }
+
+  function drawSnack(x, y) {
+    x = Math.floor(x); y = Math.floor(y);
+    // Faíscas em estrela (4 pontas cardinais + diagonais menores)
+    // Norte
+    rect(x + 6, y - 4, 1, 2, COL.yellow);
+    rect(x + 5, y - 2, 3, 1, COL.yellow);
+    // Sul
+    rect(x + 6, y + 10, 1, 2, COL.yellow);
+    rect(x + 5, y + 10, 3, 1, COL.yellow);
+    // Leste
+    rect(x + 14, y + 3, 2, 1, COL.yellow);
+    rect(x + 14, y + 3, 1, 3, COL.yellow);
+    // Oeste
+    rect(x - 3, y + 3, 2, 1, COL.yellow);
+    rect(x - 1, y + 3, 1, 3, COL.yellow);
+    // Diagonais menores
+    px(x - 2, y - 1, COL.white);
+    px(x + 13, y - 1, COL.white);
+    px(x - 2, y + 8, COL.white);
+    px(x + 13, y + 8, COL.white);
+
+    // Corpo nugget — outline escuro
+    rect(x + 1, y, 10, 9, COL.snackDark);
+    rect(x, y + 2, 12, 5, COL.snackDark);
+    rect(x + 2, y + 8, 8, 1, COL.snackDark);
+    // Cor principal (dourada)
+    rect(x + 2, y + 1, 8, 7, COL.snack);
+    rect(x + 1, y + 3, 10, 3, COL.snack);
+    // Highlight (topo-esquerdo)
+    rect(x + 3, y + 2, 3, 2, COL.yellow);
+    px(x + 4, y + 2, COL.white);
+    // Textura empanada
+    px(x + 6, y + 5, COL.snackDark);
+    px(x + 8, y + 3, COL.snackDark);
+  }
+
+  // Paleta silhueta pixel — tons da ref oficial (CCXP orange vibrante)
+  const WORLD = {
+    sky: '#FA6B1F',           // laranja vibrante da ref (mais saturado)
+    ground: '#2A1108',        // chão escuro
+    groundStreak: '#5A2A14',  // traços claros no chão
+    groundShadow: '#0A0400',  // smudges pretos
+    horizonLine: '#FA6B1F',   // linha fina laranja (mesma do céu)
+    tent: '#7A3818',          // silhueta da tenda (marrom médio, mais quente)
+    flag: '#D42020',          // bandeira vermelha (Seara)
+    flagPole: '#2A1004',
+  };
+
+  // Hash determinístico por índice (loop infinito sem costura)
+  function hashAt(idx, salt = 0) {
+    const seed = ((idx * 2654435761) ^ (salt * 0x9e3779b9)) >>> 0;
+    return {
+      r1: (seed % 100) / 100,
+      r2: ((seed >>> 8) % 100) / 100,
+      r3: ((seed >>> 16) % 100) / 100,
+      r4: ((seed >>> 24) % 100) / 100,
+    };
+  }
+
+  function drawWorld() {
+    // ---- CÉU: laranja sólido ----
+    ctx.fillStyle = WORLD.sky;
+    ctx.fillRect(0, 0, W, GROUND_Y);
+
+    // ---- FUNDO: pavilhão CCXP (PNG em loop). Sem ele, cai nas tendas procedurais ----
+    if (ASSETS.bg) {
+      drawBgLoop(ASSETS.bg, 0.3);
+      drawStandLayer();
+      drawSmoke();
+    } else {
+      drawTentLayer({ spacing: 160, parallaxRatio: 0.16, baseH: [42, 54, 68], salt: 4, alpha: 0.42, emptyRate: 0.10 });
+      drawTentLayer({ spacing: 190, parallaxRatio: 0.34, baseH: [78, 100, 128], salt: 1, alpha: 1,    emptyRate: 0.15 });
+    }
+
+    // ---- CHÃO: escuro + textura de traços/smudges ----
+    drawGround();
+  }
+
+  // Pré-aplica névoa no sprite (uma vez, no load) — mantém o PNG original limpo
+  function fogSprite(img, color, amount) {
+    const c = document.createElement('canvas');
+    c.width = img.width; c.height = img.height;
+    const g = c.getContext('2d');
+    g.drawImage(img, 0, 0);
+    g.globalCompositeOperation = 'source-atop';
+    g.globalAlpha = amount;
+    g.fillStyle = color;
+    g.fillRect(0, 0, c.width, c.height);
+    return c;
+  }
+
+  // Textura de fumaça (gerada uma vez): nuvens suaves, emenda horizontal sem costura
+  const SMOKE_W = 512;
+  let smokeTex = null;
+  function buildSmoke() {
+    const h = GROUND_Y - SMOKE.top;
+    const c = document.createElement('canvas');
+    c.width = SMOKE_W; c.height = h;
+    const g = c.getContext('2d');
+    const [r, gg, b] = SMOKE.color;
+    let seed = 7;
+    const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+    for (let i = 0; i < 70; i++) {
+      const x = rnd() * SMOKE_W;
+      const y = h * (0.35 + rnd() * 0.75);          // concentra na metade de baixo
+      const rad = 18 + rnd() * 38;
+      const a = 0.10 + rnd() * 0.16;
+      for (const dx of [-SMOKE_W, 0, SMOKE_W]) {    // desenha nas bordas também → loop sem emenda
+        const grd = g.createRadialGradient(x + dx, y, 0, x + dx, y, rad);
+        grd.addColorStop(0, `rgba(${r},${gg},${b},${a})`);
+        grd.addColorStop(1, `rgba(${r},${gg},${b},0)`);
+        g.fillStyle = grd;
+        g.fillRect(x + dx - rad, y - rad, rad * 2, rad * 2);
+      }
+    }
+    smokeTex = c;
+  }
+
+  function drawSmoke() {
+    const h = GROUND_Y - SMOKE.top;
+    const [r, g, b] = SMOKE.color;
+    // faixa fixa: transparente em cima, densa no chão
+    const grd = ctx.createLinearGradient(0, SMOKE.top, 0, GROUND_Y);
+    grd.addColorStop(0, `rgba(${r},${g},${b},0)`);
+    grd.addColorStop(1, `rgba(${r},${g},${b},${SMOKE.band})`);
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, SMOKE.top, W, h);
+    // nuvens rolando (parallax + deriva própria, pra fumaça "viver" mesmo parado)
+    if (!smokeTex) buildSmoke();
+    ctx.globalAlpha = SMOKE.puffs;
+    const off = (parallax * SMOKE.parallax + worldTime * 0.06 * SMOKE.drift) % SMOKE_W;
+    for (let x = -Math.floor(off); x < W; x += SMOKE_W) ctx.drawImage(smokeTex, x, SMOKE.top);
+    ctx.globalAlpha = 1;
+  }
+
+  // Posição de cada stand dentro de um período que se repete
+  let standLayout = [];
+  let standPeriod = 0;
+  function buildStandLayout() {
+    standLayout = [];
+    let x = 0;
+    ASSETS.stands.forEach((img, i) => {
+      standLayout.push({ img, x });
+      x += img.width + STAND_GAPS[i % STAND_GAPS.length];
+    });
+    standPeriod = x;
+  }
+
+  function drawStandLayer() {
+    if (!standPeriod) return;
+    const off = (parallax * STAND_PARALLAX) % standPeriod;
+    for (let k = 0; k * standPeriod - off < W; k++) {
+      for (const s of standLayout) {
+        const x = Math.floor(s.x + k * standPeriod - off);
+        if (x > W || x + s.img.width < 0) continue;
+        ctx.drawImage(s.img, x, GROUND_Y - s.img.height);
+      }
+    }
+  }
+
+  // Imagem de fundo em loop infinito: a borda direita do PNG emenda na esquerda.
+  // Base da imagem alinhada no chão (GROUND_Y). parallaxRatio < 1 = mais lento que o chão.
+  function drawBgLoop(img, parallaxRatio) {
+    const iw = img.width;
+    const y = GROUND_Y - img.height;
+    let x = -Math.floor((parallax * parallaxRatio) % iw);
+    for (; x < W; x += iw) ctx.drawImage(img, x, y);
+  }
+
+  // Tendas via PNG — parametrizável (spacing, parallax, altura base por variante, salt do hash, alpha)
+  // Camada de fundo usa alpha < 1 pra "misturar" com o céu → efeito de profundidade atmosférica
+  function drawTentLayer(opts) {
+    const { spacing, parallaxRatio, baseH, salt, alpha, emptyRate } = opts;
+    const offset = parallax * parallaxRatio;
+    const startIdx = Math.floor(offset / spacing) - 1;
+    const endIdx = startIdx + Math.ceil(W / spacing) + 2;
+
+    if (alpha < 1) ctx.globalAlpha = alpha;
+
+    for (let idx = startIdx; idx <= endIdx; idx++) {
+      const t = hashAt(idx, salt);
+      if (t.r4 < emptyRate) continue;
+
+      const variant = Math.floor(t.r1 * 3);
+      const scale = 0.85 + t.r2 * 0.30;
+      const th = Math.round(baseH[variant] * scale);
+      const xCenter = idx * spacing - offset + spacing / 2;
+      const baseY = GROUND_Y + 2;
+
+      const img = ASSETS.tents[variant];
+      if (img) {
+        const tw = Math.round(th * img.width / img.height);
+        const x = Math.floor(xCenter - tw / 2);
+        ctx.drawImage(img, x, baseY - th, tw, th);
+      } else {
+        const w = Math.round(th * 0.85);
+        drawTent(Math.floor(xCenter - w / 2), baseY, w, th);
+      }
+    }
+
+    if (alpha < 1) ctx.globalAlpha = 1;
+  }
+
+  // Uma tenda no estilo da referência: teto pirâmide chunky + eaves + corpo + arco + bandeira
+  function drawTent(x, baseY, w, h) {
+    const roofH = Math.floor(h * 0.55);
+    const bodyH = h - roofH;
+    const bodyY = baseY - bodyH;
+    const roofTopY = baseY - h;
+
+    ctx.fillStyle = WORLD.tent;
+
+    // TETO piramidal — degraus chunky (cada degrau ganha ~2 pixels de largura por linha)
+    // Topo bem estreito, base = w. Passo grosso pra ficar pixelado como a ref.
+    const stepH = 2;
+    const steps = Math.floor(roofH / stepH);
+    for (let i = 0; i < steps; i++) {
+      const t = i / (steps - 1 || 1);
+      const rw = Math.floor(w * (0.08 + 0.92 * t));
+      const rx = Math.floor(x + (w - rw) / 2);
+      ctx.fillRect(rx, roofTopY + i * stepH, rw, stepH);
+    }
+
+    // EAVE — linha grossa que sobra dos lados na base do teto
+    const eaveOver = Math.max(3, Math.floor(w * 0.06));
+    ctx.fillRect(x - eaveOver, baseY - bodyH - 3, w + eaveOver * 2, 3);
+
+    // CORPO retangular
+    ctx.fillRect(x, bodyY, w, bodyH);
+
+    // ARCO DE ENTRADA — triângulo/arco recortado no centro (mostra o céu por trás)
+    const doorW = Math.max(6, Math.floor(w * 0.28));
+    const doorH = Math.max(6, Math.floor(bodyH * 0.78));
+    const doorX = x + Math.floor((w - doorW) / 2);
+    const doorY = baseY - doorH;
+    ctx.fillStyle = WORLD.sky;
+    for (let i = 0; i < doorH; i++) {
+      const t = i / (doorH - 1 || 1);
+      const dw = Math.max(1, Math.floor(doorW * (0.12 + 0.88 * t)));
+      const dx = doorX + Math.floor((doorW - dw) / 2);
+      ctx.fillRect(dx, doorY + i, dw, 1);
+    }
+
+    // MASTRO + BANDEIRA vermelha no topo
+    const poleH = Math.max(8, Math.floor(h * 0.14));
+    const flagW = Math.max(6, Math.floor(w * 0.09));
+    const flagH = Math.max(4, Math.floor(poleH * 0.55));
+    const poleX = x + Math.floor(w / 2);
+    ctx.fillStyle = WORLD.flagPole;
+    ctx.fillRect(poleX, roofTopY - poleH, 1, poleH);
+    ctx.fillStyle = WORLD.flag;
+    ctx.fillRect(poleX + 1, roofTopY - poleH, flagW, flagH);
+  }
+
+  // Chão estilo ref 3 — base escura + traços claros esparsos + smudges pretos
+  function drawGround() {
+    const floorH = H - GROUND_Y;
+
+    // base
+    ctx.fillStyle = WORLD.ground;
+    ctx.fillRect(0, GROUND_Y, W, floorH);
+
+    // linha fina laranja no horizonte (separação céu×chão)
+    ctx.fillStyle = WORLD.horizonLine;
+    ctx.fillRect(0, GROUND_Y - 1, W, 1);
+
+    // traços claros (dashes horizontais rust) — parallax rápido (chão passa perto)
+    const streakScroll = parallax * 1.4;
+    const streakSpacing = 34;
+    const s0 = Math.floor(streakScroll / streakSpacing) - 1;
+    const s1 = s0 + Math.ceil(W / streakSpacing) + 2;
+    ctx.fillStyle = WORLD.groundStreak;
+    for (let idx = s0; idx <= s1; idx++) {
+      const r = hashAt(idx, 2);
+      if (r.r1 > 0.75) continue; // deixa alguns slots vazios
+      const y = GROUND_Y + 2 + Math.floor(r.r2 * (floorH - 3));
+      const sw = 8 + Math.floor(r.r3 * 28);
+      const sx = Math.floor(idx * streakSpacing - streakScroll + r.r4 * streakSpacing);
+      ctx.fillRect(sx, y, sw, 1);
+    }
+
+    // smudges pretos elongados (poças / sombras) — mais raros
+    const smudgeScroll = parallax * 1.4;
+    const smudgeSpacing = 110;
+    const m0 = Math.floor(smudgeScroll / smudgeSpacing) - 1;
+    const m1 = m0 + Math.ceil(W / smudgeSpacing) + 2;
+    ctx.fillStyle = WORLD.groundShadow;
+    for (let idx = m0; idx <= m1; idx++) {
+      const r = hashAt(idx, 3);
+      if (r.r1 > 0.55) continue;
+      const y = GROUND_Y + 4 + Math.floor(r.r2 * (floorH - 8));
+      const sw = 18 + Math.floor(r.r3 * 36);
+      const sx = Math.floor(idx * smudgeSpacing - smudgeScroll + r.r4 * smudgeSpacing);
+      // formato elíptico chapado: linha grossa + linhas mais finas nas extremidades
+      ctx.fillRect(sx + 2, y, sw - 4, 1);
+      ctx.fillRect(sx, y + 1, sw, 2);
+      ctx.fillRect(sx + 2, y + 3, sw - 4, 1);
+    }
+  }
+
+  // Utilitário: escurece/clareia uma cor hex
+  function shade(hex, amount) {
+    const c = hexToRgb(hex);
+    const t = amount < 0 ? 0 : 255;
+    const p = Math.abs(amount);
+    return `rgb(${Math.round(c.r + (t - c.r) * p)}, ${Math.round(c.g + (t - c.g) * p)}, ${Math.round(c.b + (t - c.b) * p)})`;
+  }
+
+  function spawnObstacle(spawnX) {
+    const roll = Math.random();
+    let variant, w, h;
+    if (roll < 0.65) {
+      variant = 1; // gordura-2 (bolha de óleo de frente, aspect 0.9)
+      h = 20; w = 18;
+    } else if (roll < 0.9) {
+      variant = 0; // gordura-1 (monstro de óleo chifrudo de frente, aspect 0.93)
+      h = 28; w = 26;
+    } else {
+      variant = 2; // gordura-3 (poça de óleo de frente, aspect 2.31)
+      h = 16; w = 37;
+    }
+    const y = GROUND_Y - h;
+    obstacles.push({ x: spawnX ?? W + 20, y, w, h, variant });
+  }
+
+  function spawnSnack() {
+    // Snack numa altura confortável do arco de pulo (baixo o suficiente pra pegar sempre)
+    const y = GROUND_Y - 38 - Math.random() * 22; // 38-60 acima do chão
+    snacks.push({ x: W + 20, y, w: 12, h: 8 });
+  }
+
+  function collide(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  // Text pixel (rústico, 5x7)
+  const GLYPHS = {
+    '0': ['01110','10001','10011','10101','11001','10001','01110'],
+    '1': ['00100','01100','00100','00100','00100','00100','01110'],
+    '2': ['01110','10001','00001','00010','00100','01000','11111'],
+    '3': ['11110','00001','00001','01110','00001','00001','11110'],
+    '4': ['00010','00110','01010','10010','11111','00010','00010'],
+    '5': ['11111','10000','11110','00001','00001','10001','01110'],
+    '6': ['00110','01000','10000','11110','10001','10001','01110'],
+    '7': ['11111','00001','00010','00100','01000','01000','01000'],
+    '8': ['01110','10001','10001','01110','10001','10001','01110'],
+    '9': ['01110','10001','10001','01111','00001','00010','01100'],
+    ' ': ['00000','00000','00000','00000','00000','00000','00000'],
+    ':': ['00000','00100','00000','00000','00000','00100','00000'],
+    '.': ['00000','00000','00000','00000','00000','00000','00100'],
+    '!': ['00100','00100','00100','00100','00100','00000','00100'],
+    '-': ['00000','00000','00000','01110','00000','00000','00000'],
+    'A': ['01110','10001','10001','11111','10001','10001','10001'],
+    'B': ['11110','10001','10001','11110','10001','10001','11110'],
+    'C': ['01111','10000','10000','10000','10000','10000','01111'],
+    'D': ['11110','10001','10001','10001','10001','10001','11110'],
+    'E': ['11111','10000','10000','11110','10000','10000','11111'],
+    'F': ['11111','10000','10000','11110','10000','10000','10000'],
+    'G': ['01111','10000','10000','10111','10001','10001','01111'],
+    'H': ['10001','10001','10001','11111','10001','10001','10001'],
+    'I': ['01110','00100','00100','00100','00100','00100','01110'],
+    'J': ['00111','00010','00010','00010','00010','10010','01100'],
+    'K': ['10001','10010','10100','11000','10100','10010','10001'],
+    'L': ['10000','10000','10000','10000','10000','10000','11111'],
+    'M': ['10001','11011','10101','10101','10001','10001','10001'],
+    'N': ['10001','11001','10101','10011','10001','10001','10001'],
+    'O': ['01110','10001','10001','10001','10001','10001','01110'],
+    'P': ['11110','10001','10001','11110','10000','10000','10000'],
+    'Q': ['01110','10001','10001','10001','10101','10010','01101'],
+    'R': ['11110','10001','10001','11110','10100','10010','10001'],
+    'S': ['01111','10000','10000','01110','00001','00001','11110'],
+    'T': ['11111','00100','00100','00100','00100','00100','00100'],
+    'U': ['10001','10001','10001','10001','10001','10001','01110'],
+    'V': ['10001','10001','10001','10001','10001','01010','00100'],
+    'W': ['10001','10001','10001','10101','10101','10101','01010'],
+    'X': ['10001','10001','01010','00100','01010','10001','10001'],
+    'Y': ['10001','10001','01010','00100','00100','00100','00100'],
+    'Z': ['11111','00001','00010','00100','01000','10000','11111'],
+    '?': ['01110','10001','00001','00110','00100','00000','00100'],
+    'Ç': ['01111','10000','10000','10000','10000','01111','00100'],
+    'Ã': ['01000','10001','10001','11111','10001','10001','10001'],
+  };
+  function text(str, x, y, c = '#fff', sc = 1) {
+    ctx.fillStyle = c;
+    let cx = x;
+    for (const ch of str.toUpperCase()) {
+      const g = GLYPHS[ch] || GLYPHS[' '];
+      for (let ry = 0; ry < 7; ry++) {
+        for (let rx = 0; rx < 5; rx++) {
+          if (g[ry][rx] === '1') ctx.fillRect(cx + rx * sc, y + ry * sc, sc, sc);
+        }
+      }
+      cx += 6 * sc;
+    }
+    return cx;
+  }
+
+  function drawHUD() {
+    const scoreStr = String(Math.floor(score)).padStart(5, '0');
+    const hiStr = 'HI ' + String(hi).padStart(5, '0');
+    // HI (esquerda) — scale 2 (-33% do 3 anterior)
+    text(hiStr, 8, 10, 'rgba(255,255,255,0.55)', 2);
+    // Score (direita) — scale 4 (-20% do 5 anterior; 3.5 arredondado pra cima)
+    text(scoreStr, W - 8 - scoreStr.length * 24, 8, COL.white, 4);
+  }
+
+  function drawMenu() {
+    // sobreposição
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(0, 60, W, 140);
+    text('SNACK TIME RUNNER', W / 2 - (17 * 12) / 2, 80, COL.yellow, 2);
+    text('DERROTE A GORDURA. PEGUE OS SNACKS.', W / 2 - (36 * 6) / 2, 120, COL.white, 1);
+    text('TOQUE PRA COMECAR', W / 2 - (17 * 12) / 2, 150, COL.white, 2);
+    if (hi > 0) {
+      text('MELHOR: ' + String(hi).padStart(5, '0'), W / 2 - (14 * 6) / 2, 180, 'rgba(255,255,255,0.65)', 1);
+    }
+  }
+
+  function drawButton(b, bg, border, textCol) {
+    // sombra
+    rect(b.x + 2, b.y + 3, b.w, b.h, 'rgba(0,0,0,0.35)');
+    // corpo
+    rect(b.x, b.y, b.w, b.h, bg);
+    // borda pixel
+    rect(b.x, b.y, b.w, 2, border);
+    rect(b.x, b.y + b.h - 2, b.w, 2, border);
+    rect(b.x, b.y, 2, b.h, border);
+    rect(b.x + b.w - 2, b.y, 2, b.h, border);
+    // highlight topo
+    rect(b.x + 2, b.y + 2, b.w - 4, 1, 'rgba(255,255,255,0.35)');
+    // texto centralizado
+    // escala inteira 2 sempre (escala 1 fica ilegível depois do upscale do canvas)
+    const lbl = b.label;
+    const scale = 2;
+    const tw = (lbl.length * 6 - 1) * scale;
+    const tx = Math.round(b.x + (b.w - tw) / 2), ty = Math.round(b.y + (b.h - 7 * scale) / 2);
+    text(lbl, tx + scale / 2, ty + scale / 2, 'rgba(0,0,0,0.45)', scale); // sombra do texto
+    text(lbl, tx, ty, textCol, scale);
+  }
+
+  function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 55, W, 175);
+    text('EMPANADO!', W / 2 - (10 * 12) / 2, 72, COL.seara, 2);
+    const scoreStr = String(Math.floor(score)).padStart(5, '0');
+    text('SCORE  ' + scoreStr, W / 2 - (13 * 12) / 2, 108, COL.white, 2);
+    if (Math.floor(score) >= hi && hi > 0) {
+      text('NOVO RECORDE!', W / 2 - (13 * 6) / 2, 140, COL.yellow, 1);
+    } else {
+      text('MELHOR: ' + String(hi).padStart(5, '0'), W / 2 - (14 * 6) / 2, 140, 'rgba(255,255,255,0.55)', 1);
+    }
+    // Botões
+    drawButton(overButtons.replay, '#FF6200', '#8B3400', COL.white);
+  }
+
+  // Loop
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(32, now - last);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  function update(dt) {
+    // paleta cicla sempre (menu, playing, over) — ambiente vivo
+    worldTime += dt;
+    updatePalette();
+
+    if (state !== 'playing') return;
+
+    elapsed += dt;
+    // Ramp de dificuldade: sqrt cresce rápido no começo, depois amansa; cap em ~13
+    // ~10s: 6.9  |  ~30s: 9.7  |  ~60s: 12.5  |  cap: 13.2
+    speed = baseSpeed + Math.min(10, Math.sqrt(elapsed / 700));
+
+    parallax += speed;
+
+    // Player física
+    player.vy += GRAVITY;
+    player.y += player.vy;
+    if (player.y >= GROUND_Y - player.h) {
+      player.y = GROUND_Y - player.h;
+      player.vy = 0;
+      player.onGround = true;
+    }
+    // frame de corrida
+    player.frameTick += dt;
+    if (player.frameTick > (ASSETS.hero.run.length ? HERO_FRAME_MS : 110)) {
+      player.frameTick = 0;
+      player.runFrame = (player.runFrame + 1) % (ASSETS.hero.run.length || 4);
+    }
+
+    // spawn de obstáculos — garantindo gap mínimo baseado no arco do pulo
+    spawnTimer -= dt / 16;
+    if (spawnTimer <= 0) {
+      // Distância mínima que a pessoa precisa pra pousar + recompor pulo:
+      // tempo total no ar = 2 * |JUMP_V| / GRAVITY (frames), + margem de reação
+      const airFrames = (2 * Math.abs(JUMP_V)) / GRAVITY;
+      const jumpDistance = airFrames * speed;
+      const minSafeGap = jumpDistance + 80; // margem generosa
+      const last = obstacles[obstacles.length - 1];
+      const nextX = last ? last.x + last.w + minSafeGap : W + 20;
+      const spawnX = Math.max(W + 20, nextX);
+      spawnObstacle(spawnX);
+      // próximo tick — variação pra não ficar mecânico
+      spawnTimer = 40 + Math.random() * 40;
+    }
+
+    // spawn de snacks
+    snackTimer -= dt / 16;
+    if (snackTimer <= 0) {
+      spawnSnack();
+      snackTimer = 100 + Math.random() * 80;
+    }
+
+    // move e cheque colisão
+    obstacles.forEach((o) => (o.x -= speed));
+    snacks.forEach((s) => (s.x -= speed));
+
+    for (const o of obstacles) {
+      // hitbox um pouco menor pra ser justo
+      const ohb = { x: o.x + 3, y: o.y + 3, w: o.w - 6, h: o.h - 4 };
+      // hitbox do player: aproximadamente o corpo (ignora capa, ponta capuz e pés esticados)
+      const phb = { x: player.x + 12, y: player.y + 10, w: player.w - 22, h: player.h - 16 };
+      if (collide(phb, ohb)) {
+        gameOver();
+        return;
+      }
+    }
+
+    for (const s of snacks) {
+      if (s.collected) continue;
+      if (collide({ x: player.x, y: player.y, w: player.w, h: player.h }, s)) {
+        s.collected = true;
+        score += 50;
+        beep(1000, 0.08, 'triangle', 0.05);
+        beep(1400, 0.08, 'triangle', 0.04);
+      }
+    }
+
+    obstacles = obstacles.filter((o) => o.x + o.w > -10);
+    snacks = snacks.filter((s) => s.x + s.w > -10 && !s.collected);
+
+    // score contínuo por sobrevivência
+    score += dt * 0.02;
+  }
+
+  function gameOver() {
+    state = 'over';
+    const s = Math.floor(score);
+    if (s > hi) {
+      hi = s;
+      localStorage.setItem('snackrunner_hi', String(hi));
+    }
+    beep(200, 0.3, 'sawtooth', 0.08);
+    setTimeout(() => beep(140, 0.4, 'sawtooth', 0.08), 120);
+  }
+
+  function render() {
+    // Fundo preto de segurança (só aparece se o PNG não carregar)
+    ctx.fillStyle = '#0A0A0A';
+    ctx.fillRect(0, 0, W, H);
+
+    // Cenário PNG tileado com paralaxe
+    drawWorld();
+
+    // obstáculos (PNG por variante; fallback pro drawGrease procedural)
+    for (const o of obstacles) {
+      const img = ASSETS.gorduras[o.variant];
+      if (img) {
+        ctx.drawImage(img, Math.floor(o.x), Math.floor(o.y), o.w, o.h);
+      } else {
+        drawGrease(o.x, o.y, o.w, o.h, o.variant === 2);
+      }
+    }
+
+    // snacks
+    for (const s of snacks) drawSnack(s.x, s.y);
+
+    // player
+    drawPlayer(player.x, player.y, player.runFrame);
+
+    drawHUD();
+
+    if (state === 'menu') drawMenu();
+    else if (state === 'over') drawGameOver();
+  }
+
+  // start
+  requestAnimationFrame((t) => { last = t; loop(t); });
+})();
+</script>
+</body>
+</html>
