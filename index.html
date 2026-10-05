@@ -3,12 +3,15 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#0A0A0A" />
 <title>Snack Time Runner — Protótipo</title>
 <style>
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
     margin: 0; padding: 0;
-    height: 100dvh; height: 100vh;
+    height: 100vh; height: 100dvh;
     background: #0A0A0A;
     color: #fff;
     font-family: 'Courier New', monospace;
@@ -18,7 +21,9 @@
     touch-action: manipulation;
   }
   #wrap {
-    position: fixed; inset: 0;
+    position: fixed;
+    transform: translate(-50%, -50%);
+    overflow: hidden;
     display: flex; align-items: center; justify-content: center;
     background:
       radial-gradient(ellipse at 50% 30%, #FF8C42 0%, #C44100 45%, #4A1C08 100%);
@@ -27,61 +32,44 @@
     image-rendering: pixelated;
     image-rendering: -moz-crisp-edges;
     background: transparent;
-    width: 100vw; height: auto;
-    max-height: 100vh;
-    max-width: calc(100vh * 16 / 9);
+    flex: none;
     display: block;
     box-shadow: 0 0 60px rgba(255, 98, 0, 0.35);
   }
   #hint {
-    position: fixed;
-    bottom: 16px; left: 50%;
+    position: absolute;
+    bottom: 8px; left: 50%;
     transform: translateX(-50%);
     font-size: 11px; letter-spacing: 2px;
     color: rgba(255,255,255,0.5);
     pointer-events: none;
     text-transform: uppercase;
     z-index: 10;
+    white-space: nowrap;
   }
-
-  /* MOBILE PORTRAIT: rotaciona 90° pra jogar em landscape mesmo com celular em pé */
-  @media (orientation: portrait) {
-    #wrap {
-      width: 100vh;
-      height: 100vw;
-      inset: auto;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%) rotate(90deg);
-      transform-origin: center center;
-      overflow: hidden;
-    }
-    /* Canvas mantém 16:9. Após rotação, o visual-width vira canvas.height (em CSS).
-       Pra caber na largura da tela (100vw), precisamos: canvas.width * 9/16 ≤ 100vw
-       → canvas.width ≤ 100vw * 16/9. Cap pelo mínimo entre altura da tela e essa razão. */
-    canvas {
-      width: min(100vh, calc(100vw * 16 / 9));
-      height: auto;
-      max-width: 100vh;
-      max-height: 100vw;
-    }
-    #hint {
-      transform: translateY(-50%) rotate(90deg);
-      transform-origin: center center;
-      bottom: auto;
-      top: 50%;
-      right: 4px;
-      left: auto;
-      white-space: nowrap;
-    }
+  #wrap.rotated { transform: translate(-50%, -50%) rotate(90deg); }
+  #fullscreen {
+    position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+    min-height: 44px; padding: 8px 12px; z-index: 20;
+    border: 1px solid #FFD84A; border-radius: 8px;
+    background: rgba(15,9,4,.85); color: #FFD84A;
+    font: bold 12px 'Courier New', monospace; cursor: pointer;
+  }
+  #fullscreen:focus-visible { outline: 3px solid white; outline-offset: 2px; }
+  #fullscreen-status {
+    position: absolute; top: 58px; left: 50%; transform: translateX(-50%);
+    width: min(90%, 460px); padding: 10px; border-radius: 8px;
+    background: #0F0904; font-size: 12px; text-align: center; z-index: 20;
   }
 </style>
 </head>
 <body>
 <div id="wrap">
   <canvas id="game" width="480" height="270"></canvas>
+  <button id="fullscreen" type="button" aria-pressed="false">⛶ TELA CHEIA</button>
+  <div id="fullscreen-status" role="status" hidden></div>
+  <div id="hint">TOQUE NA TELA PARA PULAR</div>
 </div>
-<div id="hint">TOQUE NA TELA PARA PULAR</div>
 
 <script>
 (() => {
@@ -91,6 +79,82 @@
 
   const W = canvas.width;
   const H = canvas.height;
+
+  const wrap = document.getElementById('wrap');
+  const fullscreenButton = document.getElementById('fullscreen');
+  const fullscreenStatus = document.getElementById('fullscreen-status');
+  let rotated = false;
+  let layoutFrame;
+  const fullscreenElement = () => document.fullscreenElement || document.webkitFullscreenElement;
+
+  // Use the visible viewport, including changes caused by browser bars and rotation.
+  function fitGame() {
+    const viewport = window.visualViewport;
+    const width = viewport?.width || window.innerWidth;
+    const height = viewport?.height || window.innerHeight;
+    rotated = height > width;
+    const stageWidth = rotated ? height : width;
+    const stageHeight = rotated ? width : height;
+    wrap.classList.toggle('rotated', rotated);
+    wrap.style.width = stageWidth + 'px';
+    wrap.style.height = stageHeight + 'px';
+    wrap.style.left = ((viewport?.offsetLeft || 0) + width / 2) + 'px';
+    wrap.style.top = ((viewport?.offsetTop || 0) + height / 2) + 'px';
+    const scale = Math.min(stageWidth / W, stageHeight / H);
+    canvas.style.width = W * scale + 'px';
+    canvas.style.height = H * scale + 'px';
+  }
+  function scheduleLayout() {
+    cancelAnimationFrame(layoutFrame);
+    layoutFrame = requestAnimationFrame(fitGame);
+  }
+  function syncFullscreen() {
+    const active = Boolean(fullscreenElement());
+    fullscreenButton.textContent = active ? '⛶ SAIR DA TELA CHEIA' : '⛶ TELA CHEIA';
+    fullscreenButton.setAttribute('aria-pressed', String(active));
+    if (!active) {
+      try { screen.orientation?.unlock?.(); } catch (_) {}
+    }
+    scheduleLayout();
+  }
+  fullscreenButton.addEventListener('click', async () => {
+    fullscreenStatus.hidden = true;
+    try {
+      if (fullscreenElement()) {
+        const exit = document.exitFullscreen || document.webkitExitFullscreen;
+        await exit.call(document);
+      } else {
+        const root = document.documentElement;
+        if (root.requestFullscreen) {
+          await root.requestFullscreen({ navigationUI: 'hide' });
+        } else if (root.webkitRequestFullscreen) {
+          await root.webkitRequestFullscreen();
+        } else {
+          fullscreenStatus.textContent = /iPhone|iPad|iPod/.test(navigator.userAgent)
+            ? 'Neste navegador, use Compartilhar → Adicionar à Tela de Início e abra por esse atalho para jogar sem as barras.'
+            : 'Este navegador não permite tela cheia. Abra o jogo em um navegador compatível.';
+          fullscreenStatus.hidden = false;
+          return;
+        }
+        // Lock when supported; otherwise the measured layout handles either orientation.
+        try { await screen.orientation?.lock?.('landscape'); } catch (_) {}
+      }
+    } catch (_) {
+      fullscreenStatus.textContent = 'Não foi possível mudar para tela cheia. Tente novamente ou abra o link no navegador do celular.';
+      fullscreenStatus.hidden = false;
+    } finally {
+      syncFullscreen();
+      fullscreenButton.blur();
+    }
+  });
+  window.addEventListener('resize', scheduleLayout);
+  window.addEventListener('orientationchange', scheduleLayout);
+  screen.orientation?.addEventListener('change', scheduleLayout);
+  window.visualViewport?.addEventListener('resize', scheduleLayout);
+  window.visualViewport?.addEventListener('scroll', scheduleLayout);
+  document.addEventListener('fullscreenchange', syncFullscreen);
+  document.addEventListener('webkitfullscreenchange', syncFullscreen);
+  fitGame();
 
   // ---------- ASSETS (PNGs reais) ----------
   const ASSETS = {
@@ -302,7 +366,9 @@
     const rect = canvas.getBoundingClientRect();
     const cx = (evt.clientX ?? (evt.touches && evt.touches[0]?.clientX) ?? 0) - rect.left;
     const cy = (evt.clientY ?? (evt.touches && evt.touches[0]?.clientY) ?? 0) - rect.top;
-    return { x: cx * (W / rect.width), y: cy * (H / rect.height) };
+    return rotated
+      ? { x: cy * (W / rect.height), y: (1 - cx / rect.width) * H }
+      : { x: cx * (W / rect.width), y: cy * (H / rect.height) };
   }
 
   // Input
@@ -323,21 +389,8 @@
     }
   }
 
-  // Portrait rotation: quando o CSS rotaciona o canvas 90°, os coords ficam desalinhados.
-  // Simplificação: em portrait, qualquer tap na tela de game-over = replay.
-  function isPortraitMobile() {
-    return window.innerHeight > window.innerWidth;
-  }
-
   function handlePointer(evt) {
     if (state === 'over') {
-      if (isPortraitMobile()) {
-        // qualquer tap = replay
-        state = 'playing';
-        resetGame();
-        beep(800, 0.08, 'triangle', 0.06);
-        return;
-      }
       const { x, y } = canvasCoords(evt);
       if (inBtn(x, y, overButtons.replay)) {
         state = 'playing';
@@ -351,6 +404,7 @@
   }
 
   window.addEventListener('keydown', (e) => {
+    if (e.target.closest?.('button')) return;
     if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); jump(); }
   });
   canvas.addEventListener('pointerdown', (e) => { e.preventDefault(); handlePointer(e); });
